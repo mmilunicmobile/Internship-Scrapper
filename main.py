@@ -127,6 +127,8 @@ def send_email(matches, unspecified_jobs):
 
     sender_email = os.environ.get("MY_EMAIL_ADDRESS")
     sender_password = os.environ.get("MY_EMAIL_APP_PASSWORD")
+    from_email = os.environ.get("FROM_EMAIL") or sender_email
+    to_email = os.environ.get("TO_EMAIL") or sender_email
 
     if not sender_email or not sender_password:
         print("Email credentials not set. Skipping email.")
@@ -150,8 +152,8 @@ def send_email(matches, unspecified_jobs):
 
     msg = EmailMessage()
     msg['Subject'] = subject
-    msg['From'] = sender_email
-    msg['To'] = sender_email
+    msg['From'] = from_email
+    msg['To'] = to_email
 
     msg.set_content("Please enable HTML to view this email.")
     msg.add_alternative(html_body, subtype='html')

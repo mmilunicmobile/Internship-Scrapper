@@ -32,6 +32,8 @@ jobs:
         env:
           MY_EMAIL_ADDRESS: ${{ secrets.MY_EMAIL_ADDRESS }}
           MY_EMAIL_APP_PASSWORD: ${{ secrets.MY_EMAIL_APP_PASSWORD }}
+          TO_EMAIL: ${{ secrets.TO_EMAIL }}
+          FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
         run: uv run --python 3.14 main.py
 
       - name: Commit and push updated seen_jobs.txt
