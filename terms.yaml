@@ -1,0 +1,15 @@
+deny_terms:
+  - "2026"
+  - "fall"
+  - "september"
+  - "october"
+  - "november"
+  - "december"
+
+good_terms:
+  - "2027"
+  - "summer"
+  - "april"
+  - "may"
+  - "june"
+  - "july"

@@ -1,7 +1,14 @@
 import os
 import smtplib
 from email.message import EmailMessage
-from playwright.sync_api import sync_playwright, TimeoutError
+from pathlib import Path
+
+from airtable_scraper import AirtableScraper
+import yaml
+
+
+PROJECT_DIR = Path(__file__).resolve().parent
+TERMS_FILE = PROJECT_DIR / "terms.yaml"
 
 
 def load_seen_jobs():
@@ -17,89 +24,35 @@ def scrape_internship():
     AIRTABLE_URL = "https://airtable.com/app17F0kkWQZhC6HB/shrOTtndhc6HSgnYb/tblp8wxvfYam5sD04?"
     MAX_ROWS_TO_SCRAPE = 200
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        page.goto(AIRTABLE_URL, wait_until="domcontentloaded", timeout=60000)
-        page.locator("div.dataRow").first.wait_for(timeout=60000)
-        print("Page and initial rows loaded.")
+    table = AirtableScraper(url=AIRTABLE_URL)
+    if table.status != "success":
+        raise RuntimeError(f"Failed to scrape Airtable (status: {table.status})")
 
-        left_pane = page.locator("div.dataLeftPane")
-        right_pane = page.locator("div.dataRightPane")
-        scroll_container = page.locator("div.antiscroll-inner").first
+    records = table.to_dict(orient="records") or []
+    internships = []
+    for record in records[:MAX_ROWS_TO_SCRAPE]:
+        values = list(record.values())
 
-        internships = []
-        processed_row_ids = set()
-        early_exit = False
+        def value_at(index):
+            value = values[index] if index < len(values) else None
+            return str(value).strip() if value is not None and str(value).strip() else "N/A"
 
-        while True:
-            left_rows = left_pane.locator("div.dataRow").all()
-            new_rows_found = False
+        job_data = {
+            "title": value_at(0),
+            "date": value_at(1),
+            "apply_link": value_at(2),
+            "location": value_at(4),
+            "company": value_at(5),
+            "salary": value_at(6),
+            "hire_time": value_at(7),
+            "grad_time": value_at(8),
+            "qualifications": value_at(11),
+        }
+        internships.append(job_data)
+        print(f"Successfully scraped: {job_data['title']} | hire_time={job_data['hire_time']!r}")
 
-            for left_row in left_rows:
-                row_id = left_row.get_attribute("data-rowid")
-                if not row_id or row_id in processed_row_ids:
-                    continue
-
-                processed_row_ids.add(row_id)
-                new_rows_found = True
-
-                job_title = left_row.locator('div[data-columnindex="0"]').inner_text()
-                right_row = right_pane.locator(f'div.dataRow[data-rowid="{row_id}"]')
-
-                scroll_container.evaluate("node => node.scrollLeft = 0")
-                page.wait_for_timeout(250)
-
-                apply_link = "N/A"
-                try:
-                    link_locator = right_row.locator('div[data-columnindex="2"] a')
-                    apply_link = link_locator.get_attribute('href', timeout=1000) or "N/A"
-                except TimeoutError:
-                    print(f"No apply button found for {job_title}")
-
-                date = right_row.locator('div[data-columnindex="1"]').inner_text()
-                location = right_row.locator('div[data-columnindex="4"]').inner_text()
-                company = right_row.locator('div[data-columnindex="5"]').inner_text()
-                salary = right_row.locator('div[data-columnindex="6"]').inner_text()
-                hire_time = right_row.locator('div[data-columnindex="7"]').inner_text()
-                grad_time = right_row.locator('div[data-columnindex="8"]').inner_text()
-
-                scroll_container.evaluate("node => node.scrollLeft = node.scrollWidth")
-                page.wait_for_timeout(250)
-
-                qualifications = right_row.locator('div[data-columnindex="11"]').inner_text()
-
-                job_data = {
-                    "title": job_title.strip() or "N/A",
-                    "apply_link": apply_link,
-                    "date": date.strip() or "N/A",
-                    "location": location.strip() or "N/A",
-                    "company": company.strip() or "N/A",
-                    "hire_time": hire_time.strip() or "N/A",
-                    "grad_time": grad_time.strip() or "N/A",
-                    "salary": salary.strip() or "N/A",
-                    "qualifications": qualifications.strip() or "N/A",
-                }
-                internships.append(job_data)
-                print(f"Successfully scraped: {job_title} | hire_time={job_data['hire_time']!r}")
-
-                if len(internships) >= MAX_ROWS_TO_SCRAPE:
-                    print(f"Reached scrape cap of {MAX_ROWS_TO_SCRAPE} jobs. Stopping.")
-                    early_exit = True
-                    break
-
-            if early_exit:
-                break
-
-            if not new_rows_found:
-                print("Reached the end of the list.")
-                break
-
-            scroll_container.evaluate("node => node.scrollTop += node.clientHeight")
-            page.wait_for_timeout(1500)
-
-        browser.close()
-        return internships
+    print(f"Scraped {len(internships)} jobs.")
+    return internships
 
 
 def filter_for_matches(internships):
@@ -116,13 +69,14 @@ def filter_for_matches(internships):
     otherwise it's ambiguous (blank hire_time, no signal at all) and goes
     to needs-review instead of being silently dropped.
     """
-    DENY_TERMS = (
-        "2026",
-        "fall", "spring", "winter",
-        "january", "february", "march",
-        "august", "september", "october", "november", "december",
-    )
-    GOOD_TERMS = ("2027", "summer", "april", "may", "june", "july")
+    with TERMS_FILE.open() as terms_file:
+        terms = yaml.safe_load(terms_file) or {}
+
+    deny_terms = terms.get("deny_terms", [])
+    good_terms = terms.get("good_terms", [])
+
+    if not isinstance(deny_terms, list) or not isinstance(good_terms, list):
+        raise ValueError("terms.yaml must define deny_terms and good_terms as lists")
 
     matches = []
     needs_review = []
@@ -130,10 +84,10 @@ def filter_for_matches(internships):
     for job in internships:
         combined = f"{job['hire_time']} {job['title']}".lower()
 
-        if any(term in combined for term in DENY_TERMS):
+        if any(term.lower() in combined for term in deny_terms):
             continue
 
-        if any(term in combined for term in GOOD_TERMS):
+        if any(term.lower() in combined for term in good_terms):
             matches.append(job)
         else:
             needs_review.append(job)
