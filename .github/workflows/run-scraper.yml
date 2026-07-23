@@ -2,8 +2,8 @@ name: Run Internship Scraper
 
 on:
   schedule:
-    - cron: '0 13 * * *'  # 9 AM EST
-    - cron: '0 1 * * *'   # 9 PM EST
+    - cron: '30 12 * * *'  # 8:30 AM EST
+    - cron: '30 23 * * *'   # 7:30 PM EST
   workflow_dispatch:
 
 permissions:
