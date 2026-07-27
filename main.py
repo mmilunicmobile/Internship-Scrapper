@@ -2,13 +2,14 @@ import os
 import smtplib
 from email.message import EmailMessage
 from pathlib import Path
+from collections import defaultdict
+import re
 
 from airtable_scraper import AirtableScraper
-import yaml
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
-TERMS_FILE = PROJECT_DIR / "terms.yaml"
+TERMS_FILE = PROJECT_DIR / "terms.py"
 
 
 def load_seen_jobs():
@@ -70,25 +71,29 @@ def filter_for_matches(internships):
     to needs-review instead of being silently dropped.
     """
     with TERMS_FILE.open() as terms_file:
-        terms = yaml.safe_load(terms_file) or {}
-
-    deny_terms = terms.get("deny_terms", [])
-    good_terms = terms.get("good_terms", [])
-
-    if not isinstance(deny_terms, list) or not isinstance(good_terms, list):
-        raise ValueError("terms.yaml must define deny_terms and good_terms as lists")
+        contents = terms_file.read()
 
     matches = []
     needs_review = []
 
     for job in internships:
+        seen_terms = defaultdict(bool)
         combined = f"{job['hire_time']} {job['title']}".lower()
+        combined_clean = re.sub(r'[^a-z0-9]+', ' ', combined.lower()).strip()
+        for term in combined_clean.split():
+            seen_terms[term] = True
+            seen_terms["_" + term] = True
 
-        if any(term.lower() in combined for term in deny_terms):
-            continue
+        exec(contents, {}, seen_terms)
 
-        if any(term.lower() in combined for term in good_terms):
+        res = seen_terms.get("RESULT")
+
+        if res == "MATCH":
             matches.append(job)
+        elif res == "DENY":
+            continue
+        elif res == "REVIEW":
+            needs_review.append(job)
         else:
             needs_review.append(job)
 
@@ -120,7 +125,7 @@ def _render_job_html(job):
     return html
 
 
-def send_email(matches, unspecified_jobs):
+def send_email(matches, unspecified_jobs, new_job_count=None, scraped_job_count=None):
     if not matches and not unspecified_jobs:
         print("No new jobs to notify about")
         return
@@ -138,7 +143,18 @@ def send_email(matches, unspecified_jobs):
     if unspecified_jobs:
         subject += f" ({len(unspecified_jobs)} more need review)"
 
+    email_summary = ""
+    if new_job_count is not None:
+        scraped_summary = (
+            f" out of {scraped_job_count} scraped"
+            if scraped_job_count is not None
+            else ""
+        )
+        email_summary = f"New jobs found this scrape: {new_job_count}{scraped_summary}."
+
     html_body = "<html><body>"
+    if email_summary:
+        html_body += f"<p>{email_summary}</p>"
     html_body += "<h2>Here are the new internships that match your criteria:</h2>"
     for job in matches:
         html_body += _render_job_html(job)
@@ -155,7 +171,11 @@ def send_email(matches, unspecified_jobs):
     msg['From'] = from_email
     msg['To'] = to_email
 
-    msg.set_content("Please enable HTML to view this email.")
+    msg.set_content(
+        f"{email_summary}\n\nPlease enable HTML to view the full email."
+        if email_summary
+        else "Please enable HTML to view this email."
+    )
     msg.add_alternative(html_body, subtype='html')
 
     total = len(matches) + len(unspecified_jobs)
@@ -173,15 +193,16 @@ if __name__ == "__main__":
     seen_jobs = load_seen_jobs()
     all_internships = scrape_internship()
     new_jobs = get_new_jobs(all_internships, seen_jobs)
+    print(f"Found {len(new_jobs)} new jobs out of {len(all_internships)} scraped.")
     my_matches, unspecified_jobs = filter_for_matches(new_jobs)
 
-    print(f"\nMatches ({len(my_matches)}):")
-    for job in my_matches:
-        print(f"  {job['title']!r} | hire_time={job['hire_time']!r}")
+    print(f"Matches: {len(my_matches)}")
+    print(f"Needs review: {len(unspecified_jobs)}")
 
-    print(f"\nNeeds review ({len(unspecified_jobs)}):")
-    for job in unspecified_jobs:
-        print(f"  {job['title']!r} | hire_time={job['hire_time']!r}")
-
-    send_email(my_matches, unspecified_jobs)
+    send_email(
+        my_matches,
+        unspecified_jobs,
+        new_job_count=len(new_jobs),
+        scraped_job_count=len(all_internships),
+    )
     print("\nScript finished.")
