@@ -1,23 +1,29 @@
 import os
 import smtplib
+import subprocess
 from email.message import EmailMessage
 from pathlib import Path
 from collections import defaultdict
 import re
 
 from airtable_scraper import AirtableScraper
+from dotenv import load_dotenv
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
 TERMS_FILE = PROJECT_DIR / "terms.py"
+SEEN_JOBS_FILE = PROJECT_DIR / "seen_jobs.txt"
+
+# Cron does not necessarily run with the project directory as its working
+# directory, so load configuration and state relative to this file.
+load_dotenv(PROJECT_DIR / ".env")
 
 
 def load_seen_jobs():
     """Load the set of already-seen job IDs from disk."""
-    SEEN_JOBS_FILE = "seen_jobs.txt"
-    if not os.path.exists(SEEN_JOBS_FILE):
-        open(SEEN_JOBS_FILE, 'w').close()
-    with open(SEEN_JOBS_FILE, 'r') as f:
+    if not SEEN_JOBS_FILE.exists():
+        SEEN_JOBS_FILE.touch()
+    with SEEN_JOBS_FILE.open() as f:
         return set(line.strip() for line in f)
 
 
@@ -101,17 +107,47 @@ def filter_for_matches(internships):
 
 
 def get_new_jobs(jobs, seen_jobs):
-    SEEN_JOBS_FILE = "seen_jobs.txt"
     new_jobs = []
     for job in jobs:
         job_id = f"{job.get('title')}-{job.get('company')}"
         if job_id not in seen_jobs:
             new_jobs.append(job)
-    with open(SEEN_JOBS_FILE, 'a') as f:
+    with SEEN_JOBS_FILE.open('a') as f:
         for job in new_jobs:
             job_id = f"{job.get('title')}-{job.get('company')}"
             f.write(job_id + "\n")
     return new_jobs
+
+
+def commit_seen_jobs():
+    """Commit the updated seen-job state for a local cron run."""
+    status = subprocess.run(
+        ["git", "status", "--porcelain", "--", SEEN_JOBS_FILE.name],
+        cwd=PROJECT_DIR,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    if not status.stdout.strip():
+        print("No changes to seen_jobs.txt to commit.")
+        return
+
+    subprocess.run(
+        ["git", "add", "--", SEEN_JOBS_FILE.name],
+        cwd=PROJECT_DIR,
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "commit",
+            "-m",
+            "Update seen_jobs.txt with new internships",
+        ],
+        cwd=PROJECT_DIR,
+        check=True,
+    )
+    print("Committed updated seen_jobs.txt.")
 
 
 def _render_job_html(job):
@@ -205,4 +241,5 @@ if __name__ == "__main__":
         new_job_count=len(new_jobs),
         scraped_job_count=len(all_internships),
     )
+    commit_seen_jobs()
     print("\nScript finished.")
