@@ -5,6 +5,7 @@ description = "Scrape internship listings and notify about matching opportunitie
 requires-python = ">=3.14,<3.15"
 dependencies = [
     "airtable-scraper==0.0.3",
+    "python-dotenv==1.1.1",
 ]
 
 [tool.uv]
