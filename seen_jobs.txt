@@ -692,3 +692,5 @@ Intern - Embedded Software, System, and Test Engineer - 2026-Motorola Solutions
 Internship - Application Development-Delta Dental of Michigan
 BUSINESS DEVELOPMENT TRAINEE / INTERN-Webmyne Systems Private Limited
 Full Stack Developer Intern (Remote)-TIKAJ
+Software Intern-Cadence
+Software Engineer Intern-Bitplaza
