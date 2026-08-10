@@ -1,43 +1,55 @@
+import html
+import json
+import logging
 import os
+import re
 import smtplib
 import subprocess
+from collections import defaultdict
 from email.message import EmailMessage
 from pathlib import Path
-from collections import defaultdict
-import re
 
 from airtable_scraper import AirtableScraper
 from dotenv import load_dotenv
+
+from codex_enrichment import enrich_jobs, job_id, pipeline_job, settings_from_environment
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
 TERMS_FILE = PROJECT_DIR / "terms.py"
 SEEN_JOBS_FILE = PROJECT_DIR / "seen_jobs.txt"
+FOUND_JOBS_FILE = PROJECT_DIR / "found_jobs.jsonl"
+CODEX_SCHEMA_FILE = PROJECT_DIR / "codex_job_schema.json"
 
 # Cron does not necessarily run with the project directory as its working
 # directory, so load configuration and state relative to this file.
 load_dotenv(PROJECT_DIR / ".env")
+
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(message)s",
+)
 
 
 def load_seen_jobs():
     """Load the set of already-seen job IDs from disk."""
     if not SEEN_JOBS_FILE.exists():
         SEEN_JOBS_FILE.touch()
-    with SEEN_JOBS_FILE.open() as f:
-        return set(line.strip() for line in f)
+    with SEEN_JOBS_FILE.open(encoding="utf-8") as seen_jobs_file:
+        return {line.strip() for line in seen_jobs_file if line.strip()}
 
 
 def scrape_internship():
-    AIRTABLE_URL = "https://airtable.com/app17F0kkWQZhC6HB/shrOTtndhc6HSgnYb/tblp8wxvfYam5sD04?"
-    MAX_ROWS_TO_SCRAPE = 200
+    airtable_url = "https://airtable.com/app17F0kkWQZhC6HB/shrOTtndhc6HSgnYb/tblp8wxvfYam5sD04?"
+    max_rows_to_scrape = 200
 
-    table = AirtableScraper(url=AIRTABLE_URL)
+    table = AirtableScraper(url=airtable_url)
     if table.status != "success":
         raise RuntimeError(f"Failed to scrape Airtable (status: {table.status})")
 
     records = table.to_dict(orient="records") or []
     internships = []
-    for record in records[:MAX_ROWS_TO_SCRAPE]:
+    for record in records[:max_rows_to_scrape]:
         values = list(record.values())
 
         def value_at(index):
@@ -63,20 +75,8 @@ def scrape_internship():
 
 
 def filter_for_matches(internships):
-    """Denylist-first split into matches / needs-review / dropped.
-
-    A job is denied (dropped entirely) if its hire_time or title mentions
-    any non-2027, non-Summer signal: "2026", a non-summer season (Fall,
-    Spring, Winter), or a month outside April-July. Denial checks title
-    too, since a job can't be Summer 2027 if its own title says "Fall".
-
-    Anything not denied is a match if it mentions "2027", or mentions
-    Summer / an April-July month (either signal alone is enough, since
-    the denylist already ruled out wrong years and wrong seasons/months);
-    otherwise it's ambiguous (blank hire_time, no signal at all) and goes
-    to needs-review instead of being silently dropped.
-    """
-    with TERMS_FILE.open() as terms_file:
+    """Denylist-first split into matches / needs-review / dropped."""
+    with TERMS_FILE.open(encoding="utf-8") as terms_file:
         contents = terms_file.read()
 
     matches = []
@@ -85,86 +85,156 @@ def filter_for_matches(internships):
     for job in internships:
         seen_terms = defaultdict(bool)
         combined = f"{job['hire_time']} {job['title']}".lower()
-        combined_clean = re.sub(r'[^a-z0-9]+', ' ', combined.lower()).strip()
+        combined_clean = re.sub(r"[^a-z0-9]+", " ", combined).strip()
         for term in combined_clean.split():
             seen_terms[term] = True
             seen_terms["_" + term] = True
 
         exec(contents, {}, seen_terms)
+        result = seen_terms.get("RESULT")
 
-        res = seen_terms.get("RESULT")
-
-        if res == "MATCH":
+        if result == "MATCH":
             matches.append(job)
-        elif res == "DENY":
-            continue
-        elif res == "REVIEW":
+        elif result == "REVIEW":
             needs_review.append(job)
-        else:
+        elif result != "DENY":
             needs_review.append(job)
 
     return matches, needs_review
 
 
 def get_new_jobs(jobs, seen_jobs):
+    """Return unique new jobs without mutating seen-job state."""
     new_jobs = []
+    new_ids = set()
     for job in jobs:
-        job_id = f"{job.get('title')}-{job.get('company')}"
-        if job_id not in seen_jobs:
+        current_job_id = job_id(job)
+        if current_job_id not in seen_jobs and current_job_id not in new_ids:
             new_jobs.append(job)
-    with SEEN_JOBS_FILE.open('a') as f:
-        for job in new_jobs:
-            job_id = f"{job.get('title')}-{job.get('company')}"
-            f.write(job_id + "\n")
+            new_ids.add(current_job_id)
     return new_jobs
 
 
-def commit_seen_jobs():
-    """Commit the updated seen-job state for a local cron run."""
+def append_found_jobs(records):
+    """Append one JSONL audit record per successfully notified new job."""
+    if not records:
+        return
+    existing_ids = set()
+    if FOUND_JOBS_FILE.exists():
+        with FOUND_JOBS_FILE.open(encoding="utf-8") as found_jobs_file:
+            for line in found_jobs_file:
+                try:
+                    existing_record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(existing_record, dict) and existing_record.get("job_id"):
+                    existing_ids.add(existing_record["job_id"])
+
+    with FOUND_JOBS_FILE.open("a", encoding="utf-8") as found_jobs_file:
+        for record in records:
+            if record.get("job_id") in existing_ids:
+                continue
+            found_jobs_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+            existing_ids.add(record.get("job_id"))
+
+
+def mark_jobs_seen(jobs):
+    """Mark jobs seen only after their notification has succeeded."""
+    if not jobs:
+        return
+    with SEEN_JOBS_FILE.open("a", encoding="utf-8") as seen_jobs_file:
+        for job in jobs:
+            seen_jobs_file.write(job_id(job) + "\n")
+
+
+def commit_state_files():
+    """Commit the synchronized JSONL audit and seen-job state files."""
     status = subprocess.run(
-        ["git", "status", "--porcelain", "--", SEEN_JOBS_FILE.name],
+        [
+            "git",
+            "status",
+            "--porcelain",
+            "--",
+            SEEN_JOBS_FILE.name,
+            FOUND_JOBS_FILE.name,
+        ],
         cwd=PROJECT_DIR,
         capture_output=True,
         text=True,
         check=True,
     )
     if not status.stdout.strip():
-        print("No changes to seen_jobs.txt to commit.")
+        print("No changes to internship state files to commit.")
         return
 
     subprocess.run(
-        ["git", "add", "--", SEEN_JOBS_FILE.name],
+        ["git", "add", "--", SEEN_JOBS_FILE.name, FOUND_JOBS_FILE.name],
         cwd=PROJECT_DIR,
         check=True,
     )
     subprocess.run(
-        [
-            "git",
-            "commit",
-            "-m",
-            "Update seen_jobs.txt with new internships",
-        ],
+        ["git", "commit", "-m", "Record enriched internships"],
         cwd=PROJECT_DIR,
         check=True,
     )
-    print("Committed updated seen_jobs.txt.")
+    print("Committed updated internship state files.")
+
+
+def _escaped(value):
+    return html.escape(str(value if value is not None else "N/A"), quote=True)
+
+
+def _safe_apply_url(value):
+    if not isinstance(value, str) or not re.match(r"^https?://[^\s]+$", value):
+        return None
+    return _escaped(value)
 
 
 def _render_job_html(job):
-    html = f"<p><b>Title:</b> {job['title']}<br>"
-    html += f"<b>Company:</b> {job['company']}<br>"
-    html += f"<b>Location:</b> {job['location']}<br>"
-    html += f"<b>Hire Time:</b> {job['hire_time']}<br>"
-    html += f"<b>Grad Time:</b> {job['grad_time']}<br>"
-    html += f"<b>Salary:</b> {job['salary']}<br>"
-    html += f'<a href="{job["apply_link"]}"><b>Apply Here</b></a></p><hr>'
-    return html
+    rendered = f"<p><b>Title:</b> {_escaped(job['title'])}<br>"
+    rendered += f"<b>Company:</b> {_escaped(job['company'])}<br>"
+    rendered += f"<b>Location:</b> {_escaped(job['location'])}<br>"
+    rendered += f"<b>Hire Time:</b> {_escaped(job['hire_time'])}<br>"
+    rendered += f"<b>Grad Time:</b> {_escaped(job['grad_time'])}<br>"
+    rendered += f"<b>Salary:</b> {_escaped(job['salary'])}<br>"
+
+    if job.get("company_description", "N/A") != "N/A":
+        rendered += f"<b>Company Description:</b> {_escaped(job['company_description'])}<br>"
+    if job.get("position_description", "N/A") != "N/A":
+        rendered += f"<b>Position Description:</b> {_escaped(job['position_description'])}<br>"
+
+    status = job.get("verification_status", "verified")
+    if status != "verified":
+        rendered += f"<b>Verification Status:</b> {_escaped(status)}<br>"
+        rendered += f"<b>Verification Notes:</b> {_escaped(job.get('verification_notes', 'N/A'))}<br>"
+
+    if job.get("salary_annualized") is True:
+        rendered += "<b>Salary Note:</b> Source explicitly identifies this compensation as annualized.<br>"
+
+    original_url = _safe_apply_url(job.get("sources", {}).get("original_apply_link", "N/A"))
+    verified_url = _safe_apply_url(job.get("sources", {}).get("verified_source_url", "N/A"))
+    primary_url = verified_url or original_url
+    if primary_url:
+        rendered += f'<a href="{primary_url}"><b>Apply Here</b></a>'
+    else:
+        rendered += "<b>Apply Here:</b> N/A"
+    if verified_url and original_url and verified_url != original_url:
+        rendered += f' · <a href="{original_url}">Original scraped link</a>'
+    return rendered + "</p><hr>"
 
 
 def send_email(matches, unspecified_jobs, new_job_count=None, scraped_job_count=None):
     if not matches and not unspecified_jobs:
         print("No new jobs to notify about")
-        return
+        return True
+
+    verified_matches = [
+        job for job in matches if job.get("verification_status", "verified") == "verified"
+    ]
+    verification_review_jobs = [
+        job for job in matches if job.get("verification_status", "verified") != "verified"
+    ]
+    review_jobs = verification_review_jobs + list(unspecified_jobs)
 
     sender_email = os.environ.get("MY_EMAIL_ADDRESS")
     sender_password = os.environ.get("MY_EMAIL_APP_PASSWORD")
@@ -173,11 +243,11 @@ def send_email(matches, unspecified_jobs, new_job_count=None, scraped_job_count=
 
     if not sender_email or not sender_password:
         print("Email credentials not set. Skipping email.")
-        return
+        return False
 
-    subject = f"Found {len(matches)} new internships that match your description!"
-    if unspecified_jobs:
-        subject += f" ({len(unspecified_jobs)} more need review)"
+    subject = f"Found {len(verified_matches)} new verified internships that match your description!"
+    if review_jobs:
+        subject += f" ({len(review_jobs)} more need review)"
 
     email_summary = ""
     if new_job_count is not None:
@@ -190,56 +260,92 @@ def send_email(matches, unspecified_jobs, new_job_count=None, scraped_job_count=
 
     html_body = "<html><body>"
     if email_summary:
-        html_body += f"<p>{email_summary}</p>"
-    html_body += "<h2>Here are the new internships that match your criteria:</h2>"
-    for job in matches:
-        html_body += _render_job_html(job)
-
-    if unspecified_jobs:
-        html_body += "<h2>Needs Review (no hire time / season info found)</h2>"
-        for job in unspecified_jobs:
+        html_body += f"<p>{_escaped(email_summary)}</p>"
+    if verified_matches:
+        html_body += "<h2>Verified internships matching your criteria</h2>"
+        for job in verified_matches:
             html_body += _render_job_html(job)
 
+    if review_jobs:
+        html_body += "<h2>Needs Review / Verification Warnings</h2>"
+        for job in review_jobs:
+            html_body += _render_job_html(job)
     html_body += "</body></html>"
 
     msg = EmailMessage()
-    msg['Subject'] = subject
-    msg['From'] = from_email
-    msg['To'] = to_email
-
+    msg["Subject"] = subject
+    msg["From"] = from_email
+    msg["To"] = to_email
     msg.set_content(
         f"{email_summary}\n\nPlease enable HTML to view the full email."
         if email_summary
         else "Please enable HTML to view this email."
     )
-    msg.add_alternative(html_body, subtype='html')
+    msg.add_alternative(html_body, subtype="html")
 
-    total = len(matches) + len(unspecified_jobs)
+    total = len(verified_matches) + len(review_jobs)
     try:
-        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
             smtp.login(sender_email, sender_password)
             smtp.send_message(msg)
         print(f"Successfully sent email with {total} new jobs!")
-    except smtplib.SMTPException as e:
-        print(f"Failed to send email: {e}")
+        return True
+    except (OSError, smtplib.SMTPException) as error:
+        print(f"Failed to send email: {error}")
+        return False
 
 
-# --- MAIN EXECUTION BLOCK ---
-if __name__ == "__main__":
+def main():
     seen_jobs = load_seen_jobs()
     all_internships = scrape_internship()
     new_jobs = get_new_jobs(all_internships, seen_jobs)
     print(f"Found {len(new_jobs)} new jobs out of {len(all_internships)} scraped.")
-    my_matches, unspecified_jobs = filter_for_matches(new_jobs)
 
+    configured_limit = os.environ.get("CODEX_MAX_NEW_JOBS", "0")
+    try:
+        max_new_jobs = max(0, int(configured_limit))
+    except ValueError:
+        raise RuntimeError(f"Invalid CODEX_MAX_NEW_JOBS={configured_limit!r}")
+    if max_new_jobs and len(new_jobs) > max_new_jobs:
+        raise RuntimeError(
+            f"Found {len(new_jobs)} new jobs, exceeding CODEX_MAX_NEW_JOBS={max_new_jobs}; "
+            "no jobs were transformed or marked seen."
+        )
+
+    if new_jobs:
+        settings = settings_from_environment(CODEX_SCHEMA_FILE)
+        print(
+            f"Enriching {len(new_jobs)} jobs with Codex "
+            f"(model={settings.model}, concurrency={settings.concurrency})."
+        )
+        enriched_records = enrich_jobs(new_jobs, settings)
+        enriched_jobs = [pipeline_job(record) for record in enriched_records]
+    else:
+        enriched_records = []
+        enriched_jobs = []
+
+    my_matches, unspecified_jobs = filter_for_matches(enriched_jobs)
     print(f"Matches: {len(my_matches)}")
     print(f"Needs review: {len(unspecified_jobs)}")
 
-    send_email(
+    if os.environ.get("CODEX_DRY_RUN", "0").lower() in {"1", "true", "yes"}:
+        print("CODEX_DRY_RUN is enabled; skipping email and state commits.")
+        return 0
+
+    if not send_email(
         my_matches,
         unspecified_jobs,
         new_job_count=len(new_jobs),
         scraped_job_count=len(all_internships),
-    )
-    commit_seen_jobs()
+    ):
+        raise RuntimeError("Email delivery failed; leaving new jobs unmarked for retry.")
+
+    append_found_jobs(enriched_records)
+    mark_jobs_seen(new_jobs)
+    commit_state_files()
     print("\nScript finished.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
