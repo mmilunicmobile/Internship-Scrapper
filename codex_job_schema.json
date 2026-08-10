@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "verification_status",
+    "verification_notes",
+    "verified_source_url",
+    "source_type",
+    "salary_annualized",
+    "normalized"
+  ],
+  "properties": {
+    "verification_status": {
+      "type": "string",
+      "enum": ["verified", "stale", "needs_review", "lookup_failed"]
+    },
+    "verification_notes": {"type": "string"},
+    "verified_source_url": {"type": "string"},
+    "source_type": {
+      "type": "string",
+      "enum": [
+        "official_employer",
+        "official_ats",
+        "reputable_board",
+        "aggregator",
+        "N/A"
+      ]
+    },
+    "salary_annualized": {
+      "oneOf": [{"type": "boolean"}, {"type": "string", "const": "N/A"}]
+    },
+    "normalized": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "title",
+        "company",
+        "location",
+        "date",
+        "salary",
+        "hire_time",
+        "grad_time",
+        "qualifications",
+        "company_description",
+        "position_description"
+      ],
+      "properties": {
+        "title": {"type": "string"},
+        "company": {"type": "string"},
+        "location": {"type": "string"},
+        "date": {"type": "string"},
+        "salary": {"type": "string"},
+        "hire_time": {"type": "string"},
+        "grad_time": {"type": "string"},
+        "qualifications": {"type": "string"},
+        "company_description": {"type": "string"},
+        "position_description": {"type": "string"}
+      }
+    }
+  }
+}
