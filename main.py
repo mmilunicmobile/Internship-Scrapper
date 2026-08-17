@@ -9,6 +9,7 @@ import re
 from airtable_scraper import AirtableScraper
 from dotenv import load_dotenv
 
+import sentry_sdk
 
 PROJECT_DIR = Path(__file__).resolve().parent
 TERMS_FILE = PROJECT_DIR / "terms.py"
@@ -17,6 +18,13 @@ SEEN_JOBS_FILE = PROJECT_DIR / "seen_jobs.txt"
 # Cron does not necessarily run with the project directory as its working
 # directory, so load configuration and state relative to this file.
 load_dotenv(PROJECT_DIR / ".env")
+
+sentry_sdk.init(
+    dsn=os.environ.get("MY_SENTRY_DNS"),
+    # Add data like request headers and IP for users,
+    # see https://docs.sentry.io/platforms/python/data-management/data-collected/ for more info
+    send_default_pii=True,
+)
 
 
 def load_seen_jobs():
@@ -221,6 +229,7 @@ def send_email(matches, unspecified_jobs, new_job_count=None, scraped_job_count=
             smtp.send_message(msg)
         print(f"Successfully sent email with {total} new jobs!")
     except smtplib.SMTPException as e:
+        sentry_sdk.capture_exception(e)
         print(f"Failed to send email: {e}")
 
 
